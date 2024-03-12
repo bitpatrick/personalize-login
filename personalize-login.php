@@ -36,12 +36,15 @@
  * Once the user has been logged out from your site, in the function wp_logout, WordPress fires the action wp_logout.
  */
 
-
+require_once 'Messanger.php';
+require_once 'Captcha.php';
 
 class Personalize_Login_Plugin
 {
 
-
+    private $login_template_name = 'lunapark_login_template';
+    private $account_template_name = 'custom_account_template';
+    private $registration_template_name = 'lunapark_registration_template';
 
     /** 
      * Initializes the plugin. 
@@ -51,12 +54,43 @@ class Personalize_Login_Plugin
      */
     public function __construct()
     {
-        add_shortcode('custom-login-form', array($this, 'render_login_form'));
-        add_action('login_form_login', array($this, 'redirect_to_custom_login'));
-        add_filter('authenticate', array($this, 'maybe_redirect_at_authenticate'), 101, 3);
-        add_action('wp_logout', array($this, 'redirect_after_logout'));
-        add_filter('login_redirect', array($this, 'redirect_after_login'), 10, 3);
-        add_action('wp_enqueue_scripts', array($this, 'login_styles'));
+
+        /**
+         *  Questo filtro viene utilizzato all'inizio del processo di autenticazione. 
+         * Si attiva prima che WordPress esegua qualsiasi controllo sull'utente, 
+         * inclusa la verifica dell'esistenza dello username e della correttezza della password.
+         */
+        add_filter('wp_authenticate_user', array($this, 'validate_login_nonce'), 10, 2);
+
+        add_filter('authenticate', array($this, 'maybe_redirect_at_authenticate'), 101, 3); // redirect user after default word press authentication
+
+        add_action('init', array($this, 'activate_user_account')); // checking user activation
+
+        add_action('login_form_register', array($this, 'user_registration_process')); // user registration process
+
+        add_action('login_form_register',  array($this, 'redirect_to_custom_url_register')); // redirect user to custom url register 
+
+        add_action('login_form_login', array($this, 'redirect_to_custom_url_login')); // redirect user to custom login url
+
+        add_filter('login_redirect', array($this, 'redirect_after_login'), 10, 3); // redirect user after login
+
+        add_action('wp_logout', array($this, 'redirect_after_logout')); // redirect user after logout
+
+        add_filter('template_include', array($this, 'render_custom_template')); // show custom page to user
+
+        add_filter('admin_init', array('Captcha', 'register_settings_fields')); // captcha
+    }
+
+    public function validate_login_nonce($user, $password)
+    {
+        // Verifica se il nonce è presente e valido
+        if (isset($_POST['user_login_nonce']) && !wp_verify_nonce($_POST['user_login_nonce'], 'user-login')) {
+            // Il nonce non è valido o non è presente
+            return new WP_Error('invalid_nonce', __('Invalid nonce provided.', 'personalize-login'));
+        }
+
+        // Se tutto è corretto, ritorna l'oggetto $user per continuare il processo di autenticazione
+        return $user;
     }
 
     /** 
@@ -66,111 +100,314 @@ class Personalize_Login_Plugin
      */
     public static function plugin_activated()
     {
-        // Information needed for creating the plugin's pages 
-        $page_definitions = array(
-            'member-login' => array(
-                'title' => __('Sign In', 'personalize-login'),
-                'content' => '[custom-login-form]'
-            ),
-            'member-account' => array(
-                'title' => __('Your Account', 'personalize-login'),
-                'content' => '[account-info]'
-            ),
+    }
+
+    public function activate_user_account()
+    {
+        if (isset($_GET['key']) && isset($_GET['user'])) {
+            $user_id = intval($_GET['user']);
+            $activation_code = get_user_meta($user_id, 'activation_code', true);
+
+            if ($activation_code === $_GET['key']) {
+                // Elimina il codice di attivazione in quanto non sarà più necessario
+                delete_user_meta($user_id, 'activation_code');
+
+                // Attiva l'account dell'utente
+                update_user_meta($user_id, 'account_activated', 1);
+
+                $redirect_to = add_query_arg('activation', 'successful', home_url());
+
+                // Reindirizza l'utente a una pagina con un messaggio di attivazione riuscita
+                wp_redirect($redirect_to);
+                exit;
+            }
+        }
+    }
+
+    /** 
+     * Redirects the user to the custom registration page instead 
+     * of wp-login.php?action=register. 
+     */
+    public function redirect_to_custom_url_register()
+    {
+        if ('GET' == $_SERVER['REQUEST_METHOD']) {
+            if (is_user_logged_in()) {
+                $this->redirect_logged_in_user();
+            } else {
+                wp_redirect(home_url('member-register'));
+            }
+            exit;
+        }
+    }
+
+    /** 
+     * Handles the registration of a new user. 
+     * 
+     * Used through the action hook "login_form_register" activated on wp-login.php 
+     * when accessed through the registration action. 
+     */
+    public function user_registration_process()
+    {
+        if ('POST' == $_SERVER['REQUEST_METHOD']) {
+
+            $redirect_url = home_url('member-register');
+
+            if (!get_option('users_can_register')) {
+                // Registration closed, display error 
+                $redirect_url = add_query_arg('register-errors', 'closed', $redirect_url);
+            } elseif (!isset($_POST['user_register_nonce']) || !wp_verify_nonce($_POST['user_register_nonce'], 'user-registration')) {
+                // Nonce non valido, mostrare un messaggio di errore o reindirizzare
+                $redirect_url = add_query_arg('register-errors', 'nonce_failed', $redirect_url);
+            } elseif (!Captcha::verify_recaptcha()) {
+                // Recaptcha check failed, display error 
+                $redirect_url = add_query_arg('register-errors', 'captcha', $redirect_url);
+            } elseif ($_POST["password"] != $_POST["confirm_password"]) {
+                // compare error passwords
+                $redirect_url = add_query_arg('register-errors', 'compare-passwords', $redirect_url);
+            } else {
+
+                $user_login        = sanitize_user($_POST["username"]);
+                $user_email        = sanitize_email($_POST["email"]);
+                $user_first_name   = sanitize_text_field($_POST["first_name"]);
+                $user_last_name    = sanitize_text_field($_POST["last_name"]);
+                $user_pass         = $_POST["password"];
+                // $red_role         = sanitize_text_field($_POST["role"]);
+
+                $result = $this->create_user($user_login, $user_email, $user_first_name, $user_last_name, $user_pass);
+                if (is_wp_error($result)) {
+                    // Parse errors into a string and append as parameter to redirect 
+                    $errors = join(',', $result->get_error_codes());
+                    $redirect_url = add_query_arg('register-errors', $errors, $redirect_url);
+                } else {
+
+                    // Success, redirect to login page. 
+                    $redirect_url = home_url('member-login');
+                    $redirect_url = add_query_arg('registered', $user_email, $redirect_url);
+                }
+            }
+
+            wp_safe_redirect($redirect_url);
+            exit;
+        }
+    }
+
+    /** 
+     * Validates and then completes the new user signup process if all went well. 
+     * 
+     * @param string $email The new user's email address 
+     * @param string $first_name The new user's first name 
+     * @param string $last_name The new user's last name 
+     * 
+     * @return int|WP_Error The id of the user that was created, or error if failed. 
+     */
+    private function create_user($user_login, $user_email, $user_first_name, $user_last_name, $user_pass)
+    {
+        $errors = new WP_Error();
+        // Email address is used as both username and email. It is also the only 
+        // parameter we need to validate 
+        if (!is_email($user_email)) {
+            $errors->add('email', Messanger::get_error_message('email'));
+        }
+        if (username_exists($user_login)) {
+            $errors->add('username_exists', Messanger::get_error_message('username_exists'));
+        }
+        if (email_exists($user_email)) {
+            $errors->add('email_exists', Messanger::get_error_message('email_exists'));
+        }
+        // Verifica se sono stati aggiunti errori
+        if ($errors->has_errors()) {
+            return $errors;
+        }
+
+        // Generate the password so that the subscriber will have to check email... 
+        $user_data = array(
+            'user_login'    => $user_login,
+            'user_email'    => $user_email,
+            'user_pass'     => $user_pass,
+            'first_name'    => $user_first_name,
+            'last_name'     => $user_last_name,
+            'nickname'      => $user_login,
         );
-        foreach ($page_definitions as $slug => $page) {
-            // Check that the page doesn't exist already 
-            $query = new WP_Query('pagename=' . $slug);
-            if (!$query->have_posts()) {
-                // Add the page using the data from the array above 
-                wp_insert_post(
-                    array(
-                        'post_content'   => $page['content'],
-                        'post_name'      => $slug,
-                        'post_title'     => $page['title'],
-                        'post_status'    => 'publish',
-                        'post_type'      => 'page',
-                        'ping_status'    => 'closed',
-                        'comment_status' => 'closed',
-                    )
-                );
-            }
+        $user_id = wp_insert_user($user_data);
+
+        if (!is_wp_error($user_id)) {
+
+            // Imposta l'utente come non attivo
+            add_user_meta($user_id, 'account_activated', 0);
+
+            // Genera un token di attivazione univoco
+            $activation_code = sha1($user_login . time());
+
+            // Salva il codice di attivazione nei metadati dell'utente
+            add_user_meta($user_id, 'activation_code', $activation_code, true);
+
+            // Crea il link di attivazione
+            $activation_link = add_query_arg(array(
+                'key' => $activation_code,
+                'user' => $user_id
+            ), home_url('activate'));
+
+            // Invia l'email di attivazione
+            $this->send_activation_email($user_email, $activation_link);
         }
+
+        return $user_id;
     }
 
-    /** 
-     * A shortcode for rendering the login form. 
-     * 
-     * @param array $attributes Shortcode attributes. 
-     * @param string $content The text content for shortcode. Not used. 
-     * 
-     * @return string The shortcode output 
-     */
-    public function render_login_form($attributes, $content = null)
+    private function send_activation_email($user_email, $activation_link)
     {
-        // Parse shortcode attributes 
-        $default_attributes = array('show_title' => false);
-        $attributes = shortcode_atts($default_attributes, $attributes);
-        $show_title = $attributes['show_title'];
-        if (is_user_logged_in()) {
-            return __('You are already signed in.', 'personalize-login');
-        }
+        $subject = 'Attiva il tuo account';
+        $message = 'Clicca su questo link per attivare il tuo account: ' . $activation_link;
+        $headers = 'From: Your Name <your-email@example.com>' . "\r\n";
 
-        // Pass the redirect parameter to the WordPress login functionality: by default, 
-        // don't specify a redirect, but if a valid redirect URL has been passed as 
-        // request parameter, use it. 
-        $attributes['redirect'] = '';
-        if (isset($_REQUEST['redirect_to'])) {
-            $attributes['redirect'] = wp_validate_redirect($_REQUEST['redirect_to'], $attributes['redirect']);
-        }
-
-        // Error messages 
-        $errors = array();
-        if (isset($_REQUEST['login'])) {
-            $error_codes = explode(',', $_REQUEST['login']);
-            foreach ($error_codes as $code) {
-                $errors[] = $this->get_error_message($code);
-            }
-        }
-        $attributes['errors'] = $errors;
-
-        // Check if user just logged out 
-        $attributes['logged_out'] = isset($_REQUEST['logged_out']) && $_REQUEST['logged_out'] == true;
-
-        // Render the login form using an external template 
-        return $this->get_template_html('blp_form', $attributes);
+        wp_mail($user_email, $subject, $message, $headers);
     }
 
-    /** 
-     * Renders the contents of the given template to a string and returns it. 
-     * 
-     * @param string $template_name The name of the template to render (without .php) 
-     * @param array $attributes The PHP variables for the template 
-     * 
-     * @return string The contents of the template. 
-     */
-    private function get_template_html($template_name, $attributes = null)
-    {
-        if (!$attributes) {
-            $attributes = array();
-        }
-        ob_start();
-        do_action('personalize_login_before_' . $template_name);
-        require('templates/' . $template_name . '.php');
-        do_action('personalize_login_after_' . $template_name);
-        $html = ob_get_contents();
-        ob_end_clean();
-        return $html;
-    }
-
-    /** 
-     * Redirect the user to the custom login page instead of wp-login.php. 
-     */
-    function redirect_to_custom_login()
+    public function render_custom_template($template)
     {
         if ($_SERVER['REQUEST_METHOD'] == 'GET') {
+
+            $url_requested = $_SERVER['REQUEST_URI'];
+
+            $login_slug = 'member-login';
+            $registration_slug = 'member-register';
+            $account_slug = 'member-account';
+
+            $template_name = null;
+
+            if (strpos($url_requested, $login_slug) !== false && !is_user_logged_in()) {
+
+                // LOGIN PAGE
+                $template_name = $this->login_template_name;
+            } elseif (strpos($url_requested, $registration_slug) !== false && !is_user_logged_in()) {
+
+                // REGISTRATION PAGE
+                $template_name = $this->registration_template_name;
+
+                // SETTING CAPTCHA
+                add_action('wp_print_footer_scripts', array('Captcha', 'add_captcha_js_to_footer'));
+            } else if (strpos($url_requested, $account_slug) !== false && is_user_logged_in()) {
+
+                // recupera id utente
+                $user_id = get_current_user_id();
+
+                if ($this->account_activated($user_id)) {
+
+                    // ACCOUNT ATTIVO
+                    $template_name = $this->account_template_name;
+                } else {
+
+                    // ACCOUNT NON ATTIVO
+                    wp_safe_redirect(home_url());
+                    exit;
+                }
+            }
+
+            // Verifica l'esistenza del template e imposta lo status header a 200
+            $custom_template = plugin_dir_path(__FILE__) . 'templates/' . $template_name . '.php';
+            if (file_exists($custom_template)) {
+
+                // Imposta l'header della risposta HTTP a 200 OK
+                status_header(200);
+
+                // ottieni attributi template
+                $attributes = $this->get_attributes();
+
+                // Retrieve recaptcha key 
+                $attributes['recaptcha_site_key']  = get_option('personalize-login-recaptcha-site-key', null);
+
+                // Passa gli attributi al template
+                extract($attributes);
+
+                // load css
+                $this->load_css($template_name);
+
+                include $custom_template;
+                exit;
+            }
+        }
+
+        return $template; // Restituisce il template originale se nessuna pagina custom è stata trovata
+    }
+
+    private function load_css($template_name)
+    {
+
+        switch ($template_name) {
+
+            case 'lunapark_login_template':
+
+            case 'lunapark_registration_template':
+                // LOADING CSS
+                wp_enqueue_style('login-style', plugin_dir_url(__FILE__) . 'css/lunapark-style.css');
+                wp_enqueue_style('boxicons', 'https://unpkg.com/boxicons@2.1.4/css/boxicons.min.css', array(), '2.1.4');
+
+                break;
+        }
+    }
+
+    private function account_activated($user_id)
+    {
+
+        $activation_code = get_user_meta($user_id, 'account_activated', true);
+
+        if ($activation_code === 1) {
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private function get_attributes(): array
+    {
+        $attributes = array();
+        // Retrieve recaptcha key 
+        $attributes['recaptcha_site_key'] = get_option('personalize-login-recaptcha-site-key', null);
+
+        $messages = [];
+
+        // Check if user just logged out
+        if (isset($_GET['logged_out']) && $_GET['logged_out'] == 'true') {
+            $info_message = Messanger::get_info_message('successful_logout');
+            $messages['logged_out'] = $info_message;
+        }
+
+        // Check for any error message during user login
+        if (isset($_GET['login'])) {
+            $error_message = Messanger::get_error_message($_GET['login']);
+            // Assign the error message to the error_messages array
+            $messages['errors'][] = $error_message;
+        }
+
+        // Retrieve possible errors from request parameters 
+        if (isset($_GET['register-errors'])) {
+            $error_codes = explode(',', $_GET['register-errors']);
+            foreach ($error_codes as $error_code) {
+                $messages['errors'][] = Messanger::get_error_message($error_code);
+            }
+        }
+
+        // Qui inserisci l'array messages dentro l'array attributes
+        $attributes['messages'] = $messages;
+
+        return $attributes;
+    }
+
+    /** 
+     * Redirects the user to the login URL instead page of wp-login.php. 
+     */
+    function redirect_to_custom_url_login()
+    {
+        if ($_SERVER['REQUEST_METHOD'] == 'GET') {
+
             $redirect_to = isset($_REQUEST['redirect_to']) ? $_REQUEST['redirect_to'] : null;
 
             if (is_user_logged_in()) {
+
+                /**
+                 * UTENTE LOGGATO CHE STA PROVANDO AD ACCEDERE ALLA PAGINA DI LOGIN VIENE REINDIRIZZATO
+                 */
                 $this->redirect_logged_in_user($redirect_to);
                 exit;
             }
@@ -179,7 +416,7 @@ class Personalize_Login_Plugin
             if (!empty($redirect_to)) {
                 $login_url = add_query_arg('redirect_to', $redirect_to, $login_url);
             }
-            wp_redirect($login_url);
+            wp_safe_redirect($login_url);
             exit;
         }
     }
@@ -230,38 +467,6 @@ class Personalize_Login_Plugin
     }
 
     /** 
-     * Finds and returns a matching error message for the given error code. 
-     * 
-     * @param string $error_code The error code to look up. 
-     * 
-     * @return string An error message. 
-     */
-    private function get_error_message($error_code)
-    {
-        switch ($error_code) {
-            case 'empty_username':
-                return __('You do have an email address, right?', 'personalize-login');
-            case 'empty_password':
-                return __('You need to enter a password to login.', 'personalize-login');
-            case 'invalid_username':
-                return __(
-                    "We don't have any users with that email address. Maybe you used a different one when signing up?",
-                    'personalize-login'
-                );
-            case 'incorrect_password':
-                $err = __(
-                    "The password you entered wasn't quite right. <a href='%s'>Did you forget your password</a>?",
-                    'personalize-login'
-                );
-                return sprintf($err, wp_lostpassword_url());
-            default:
-                break;
-        }
-
-        return __('An unknown error occurred. Please try again later.', 'personalize-login');
-    }
-
-    /** 
      * Redirect to custom login page after the user has been logged out. 
      */
     public function redirect_after_logout()
@@ -299,17 +504,11 @@ class Personalize_Login_Plugin
         }
         return wp_validate_redirect($redirect_url, home_url());
     }
-
-    public function login_styles()
-    {
-
-        if (is_page('member-login')) {
-            // Accoda lo stile CSS solo se ci troviamo nella pagina "member-login"
-            wp_enqueue_style('login-style', plugin_dir_url(__FILE__) . 'css/login-style.css');
-            wp_enqueue_style('boxicons', 'https://unpkg.com/boxicons@2.1.4/css/boxicons.min.css', array(), '2.1.4');
-        }
-    }
 }
+
+// initialize captcha
+$captcha = new Captcha();
+
 // Initialize the plugin 
 $personalize_login_pages_plugin = new Personalize_Login_Plugin();
 

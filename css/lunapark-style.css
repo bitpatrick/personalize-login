@@ -33,7 +33,8 @@ body {
 .wrapper h1 {
   font-size: 36px;
   text-align: center;
-  
+  color: #fff;
+  font-family: "Poppins", sans-serif;
 }
 
 .wrapper .input-box {
